@@ -10,7 +10,7 @@ It performs three main functions:
 1. Sends the latest shopped and Click & Collect store information for customers.
 2. Triggers **Low Stock** emails.
 3. Triggers **Back In Stock** emails.
-
+ 
 ## Project Structure
 EDW_Ometria_Payloads/
 ├── main.py                 # Main orchestration script
