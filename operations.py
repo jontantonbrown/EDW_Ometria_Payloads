@@ -80,16 +80,54 @@ def update_db_control(conn, updated_by, process, sub_process, descr):
     conn.execute(sql)
 
 
-def wait_for_dependencies(edw):
+def check_dependencies(edw_conn):
+    logger.log_info('Checking dependent processes (IP, SCV, OneStock, Ometria S3 load, SQL Executer)...')
     count = 0
     while True:
-        # Check if the main MSTR has been triggered:
-        stmt = edw.execute("SELECT EVENT_TIMESTAMP "
-                           "FROM LAYER0_CONTROL.DB_LOGS "
-                           "WHERE EVENT_DATE = SYSDATE "
-                           "AND PROCESS = 'EDW Overnight Process' "
-                           "AND SUB_PROCESS = 'MicroStrategy Events Triggered' "
-                           "AND DESCR = 'Triggered'")
+        # Check if dependent processes have updated...
+        stmt = edw_conn.execute("""SELECT COUNT(*) CNT
+                                    FROM (
+                                        -- Island Pacific:
+                                        SELECT MIN(EVENT_TIMESTAMP) COMPLETE_TIMESTAMP 
+                                        FROM LAYER0_CONTROL.DB_LOGS 
+                                        WHERE EVENT_DATE = CURRENT_DATE 
+                                        AND PROCESS = 'EDW Overnight Process' 
+                                        AND SUB_PROCESS = 'MicroStrategy Events Triggered' -- IP
+                                        AND DESCR = 'Triggered' 
+                                        UNION ALL 
+                                        -- Single Customer View
+                                        SELECT MIN(EVENT_TIMESTAMP) COMPLETE_TIMESTAMP
+                                        FROM LAYER0_CONTROL.DB_LOGS 
+                                        WHERE EVENT_DATE = CURRENT_DATE
+                                        AND PROCESS = 'Single Customer View'
+                                        AND SUB_PROCESS IS NULL  
+                                        AND DESCR = 'Process complete'
+                                        UNION ALL 
+                                        -- OneStock process
+                                        SELECT MIN(EVENT_TIMESTAMP) COMPLETE_TIMESTAMP
+                                        FROM LAYER0_CONTROL.DB_LOGS 
+                                        WHERE EVENT_DATE = CURRENT_DATE
+                                        AND PROCESS = 'EDW to OneStock Process'
+                                        AND SUB_PROCESS IS NULL  
+                                        AND DESCR = 'Process complete'
+                                        UNION ALL 
+                                        -- Ometria S3 > EDW process
+                                        SELECT MIN(EVENT_TIMESTAMP) COMPLETE_TIMESTAMP
+                                        FROM LAYER0_CONTROL.DB_LOGS 
+                                        WHERE EVENT_DATE = CURRENT_DATE
+                                        AND PROCESS = 'Ometria S3 to EDW Processing'
+                                        AND SUB_PROCESS IS NULL  
+                                        AND DESCR = 'Process complete'
+                                        UNION ALL 
+                                        -- SQL Executer (updates the PROD_OPTION tables)
+                                        SELECT MIN(EVENT_TIMESTAMP) COMPLETE_TIMESTAMP
+                                        FROM LAYER0_CONTROL.DB_LOGS 
+                                        WHERE EVENT_DATE = CURRENT_DATE
+                                        AND PROCESS = 'EDW SQL Script Executer'
+                                        AND SUB_PROCESS IS NULL  
+                                        AND DESCR = 'Process complete')
+                                    WHERE COMPLETE_TIMESTAMP IS NOT NULL
+                                    HAVING COUNT(*) = 5""")
 
         record = stmt.fetchall()
 
@@ -99,12 +137,10 @@ def wait_for_dependencies(edw):
             exit()
 
         if record:
-            latest_record_id = record[0]
-            logger.log_info("MicroStrategy reports have been triggered. Moving to next stage.")
-            # Perform your other task here
+            logger.log_info("Dependent jobs completed. Moving to next stage.")
             break
         else:
-            logger.log_info("MicroStrategy reports have not yet triggered. Wait another minute...")
+            logger.log_info("Dependent jobs not yet completed. Wait another minute...")
 
         count += 1
         # Wait for one minute before checking again
@@ -364,16 +400,21 @@ def send_customer_locations_to_ometria(edw_conn):
 
 
 def retrieve_low_stock_monsoon_data(edw_conn):
+    logger.log_info('Retrieving low stock data from EDW...')
     monsoon_sql = 'SELECT * FROM REVERSE_ETL_PROD.OMETRIA_LOW_STOCK_EMAIL_TRIGGER_MONSOON_VW'
     monsoon_df = edw_conn.export_to_pandas(monsoon_sql)
+    logger.log_info('Low stock data retrieved successfully.')
 
     return monsoon_df
 
 
 def create_low_stock_monsoon_payload(df: pd.DataFrame, event_type: str = "low_stock", timestamp: str = None) -> list:
+    logger.log_info('Creating low stock payload...')
+
     if timestamp is None:
         timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Group and aggregate
     grouped = (df.groupby('EMAIL')
                .agg({
         'ID': 'first',  # take the first id for the email
@@ -382,11 +423,13 @@ def create_low_stock_monsoon_payload(df: pd.DataFrame, event_type: str = "low_st
                .reset_index())
 
     payloads = []
-
     for _, row in grouped.iterrows():
+        # Convert PROD_OPTION values to strings (this is the key fix)
+        prod_options = [str(option) for option in row['PROD_OPTION']]
+
         payload = {
             "properties": {
-                "products_list_custom_field": row['PROD_OPTION']
+                "product_id": prod_options
             },
             "@type": "custom_event",
             "id": str(row['ID']),
@@ -396,6 +439,7 @@ def create_low_stock_monsoon_payload(df: pd.DataFrame, event_type: str = "low_st
         }
         payloads.append(payload)
 
+    logger.log_info(f'Low stock payload created with {len(payloads)} events.')
     return payloads
 
 
@@ -415,17 +459,18 @@ def update_audit_log(edw_conn, df: pd.DataFrame,event_type,timestamp: str = None
 
 
 def retrieve_back_in_stock_monsoon_data(edw_conn):
+    logger.log_info('Retrieving browsers back in stock data from EDW...')
     monsoon_sql = 'SELECT * FROM REVERSE_ETL_PROD.OMETRIA_BACK_IN_STOCK_EMAIL_TRIGGER_MONSOON_VW'
     monsoon_df = edw_conn.export_to_pandas(monsoon_sql)
-
+    logger.log_info('Browsers back in stock data successfully retrieved')
     return monsoon_df
 
 
-def create_back_in_stock_monsoon_payload(df: pd.DataFrame,event_type: str = "back_in_stock",timestamp: str = None) -> list:
+def create_back_in_stock_monsoon_payload(df: pd.DataFrame,event_type: str = "browsers_back_in_stock",timestamp: str = None) -> list:
     if timestamp is None:
         timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Group by email: take first ID and collect all product options into a list
+    # Group by email
     grouped = (df.groupby('EMAIL')
                .agg({
         'ID': 'first',  # one ID per email
@@ -435,12 +480,15 @@ def create_back_in_stock_monsoon_payload(df: pd.DataFrame,event_type: str = "bac
 
     payloads = []
     for _, row in grouped.iterrows():
+        # Convert all product IDs to strings (very important!)
+        product_ids = [str(option) for option in row['PROD_OPTION']]
+
         payload = {
             "properties": {
-                "products_list_custom_field": row['PROD_OPTION']
+                "product_id": product_ids  # ← now list of strings
             },
             "@type": "custom_event",
-            "id": str(row['ID']),  # ensure string as in example
+            "id": str(row['ID']),
             "event_type": event_type,
             "timestamp": timestamp,
             "identity_email": row['EMAIL']
@@ -448,3 +496,65 @@ def create_back_in_stock_monsoon_payload(df: pd.DataFrame,event_type: str = "bac
         payloads.append(payload)
 
     return payloads
+
+
+def send_low_stock_payloads_to_ometria(low_stock_monsoon_df, edw_conn):
+    low_stock_monsoon_df = low_stock_monsoon_df.reset_index(drop=True)
+
+    chunk_size = 100
+
+    for i in range(0, len(low_stock_monsoon_df), chunk_size):
+        chunk_df = low_stock_monsoon_df.iloc[i:i + chunk_size]
+
+        try:
+            # Create payload for this chunk
+            chunk_payload = create_low_stock_monsoon_payload(chunk_df)
+
+            # Send to Ometria
+            send_to_ometria(chunk_payload, 'Monsoon')
+
+            # Update audit log immediately for this chunk (only successful ones)
+            update_audit_log(edw_conn, chunk_df, 'low_stock')
+
+            print(f"✅ Sent and audited chunk {i // chunk_size + 1} "
+                  f"({len(chunk_df)} records)")
+
+        except Exception as e:
+            print(f"❌ Failed on chunk starting at index {i}: {e}")
+            # Optionally break or continue depending on your preference
+            # break   # uncomment if you want to stop on first error
+
+        # Small delay between requests (skip after last chunk)
+        if i + chunk_size < len(low_stock_monsoon_df):
+            time.sleep(0.1)
+
+
+def send_browsers_back_in_stock_payloads_to_ometria(back_in_stock_monsoon_df, edw_conn):
+    back_in_stock_monsoon_df = back_in_stock_monsoon_df.reset_index(drop=True)
+
+    chunk_size = 100
+
+    for i in range(0, len(back_in_stock_monsoon_df), chunk_size):
+        chunk_df = back_in_stock_monsoon_df.iloc[i:i + chunk_size]
+
+        try:
+            # Create payload for this chunk
+            chunk_payload = create_back_in_stock_monsoon_payload(chunk_df)
+
+            # Send to Ometria
+            send_to_ometria(chunk_payload, 'Monsoon')
+
+            # Update audit log immediately for this chunk (only successful ones)
+            update_audit_log(edw_conn, chunk_df, 'browsers_back_in_stock')
+
+            print(f"✅ Sent and audited chunk {i // chunk_size + 1} "
+                  f"({len(chunk_df)} records)")
+
+        except Exception as e:
+            print(f"❌ Failed on chunk starting at index {i}: {e}")
+            # Optionally break or continue depending on your preference
+            # break   # uncomment if you want to stop on first error
+
+        # Small delay between requests (skip after last chunk)
+        if i + chunk_size < len(back_in_stock_monsoon_df):
+            time.sleep(0.1)
